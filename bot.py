@@ -566,14 +566,19 @@ async def send_comic_post(
             count = 0
             if sent:
                 ids = [m.message_id for m in sent]
+                count = len(photos)
                 await asyncio.sleep(1.2)
-                await safe_telegram_call(
-                    bot.send_message, chat_id=chat_id,
-                    text=f"📖 <i>{post.character} ({len(photos)}P)</i> — Tap below when finished:",
-                    parse_mode=ParseMode.HTML, reply_to_message_id=ids[0],
-                    reply_markup=done_keyboard(ids),
-                )
-                count = len(photos) + 1
+                try:
+                    control = await safe_telegram_call(
+                        bot.send_message, chat_id=chat_id,
+                        text=f"📖 <i>{post.character} ({len(photos)}P)</i> — Tap below when finished:",
+                        parse_mode=ParseMode.HTML, reply_to_message_id=ids[0],
+                        reply_markup=done_keyboard(ids),
+                    )
+                    if control:
+                        count += 1
+                except Exception as exc:
+                    logger.warning(f"Media group delivered for post {post.post_id}, but control message failed: {exc}")
         if count:
             logger.success(f"Sent [{post.character}] ({post.post_id}, {len(photos)}P) -> chat {chat_id}")
         return count
