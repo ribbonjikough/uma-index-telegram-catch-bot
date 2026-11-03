@@ -13,7 +13,7 @@ from telegram import (
     ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
 )
@@ -139,6 +139,9 @@ class PostStore:
         rows = self.q("SELECT data FROM posts_cache WHERE post_id = ?", post_id)
         return UmaComicPost(**json.loads(rows[0][0])) if rows else None
 
+    def get_cached_ids(self) -> list[str]:
+        return [r[0] for r in self.q("SELECT post_id FROM posts_cache")]
+
     def save_post_to_cache(self, post: UmaComicPost):
         self.q("INSERT OR REPLACE INTO posts_cache VALUES (?, ?)", post.post_id, json.dumps(asdict(post)))
 
@@ -229,20 +232,28 @@ def upgrade_twimg_url(url: str) -> str:
     return url
 
 
-async def resolve_tweet_images(client: httpx.AsyncClient, tweet_url: str) -> list[str]:
-    """Fallback resolver if the website modal didn't already supply all pages."""
+async def resolve_tweet_images(client: httpx.AsyncClient, tweet_url: str, expected: int = 1) -> list[str]:
+    """
+    Resolves every photo of the tweet, in order. A tier that returns fewer photos than
+    the site announced (e.g. 1 of 2) is not trusted: the next tier is tried, best result wins.
+    """
     match = TWEET_ID_REGEX.search(tweet_url)
     if not match:
         return []
+    best: list[str] = []
     for build_url, extract in RESOLVERS:
         try:
             resp = await client.get(build_url(match.group(1)), timeout=12.0)
-            if resp.status_code == 200 and (urls := extract(resp.json())):
-                return [u for u in map(upgrade_twimg_url, urls) if u][:4]
+            if resp.status_code == 200:
+                urls = [u for u in dict.fromkeys(map(upgrade_twimg_url, extract(resp.json()))) if u][:4]
+                best = max(best, urls, key=len)
+                if len(best) >= expected:
+                    return best
         except Exception as exc:
             logger.debug(f"Resolver fallback triggered for {tweet_url}: {exc}")
-    logger.warning(f"All X image resolvers failed for {tweet_url}")
-    return []
+    if not best:
+        logger.warning(f"All X image resolvers failed for {tweet_url}")
+    return best
 
 
 async def download_image_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
@@ -265,16 +276,20 @@ async def download_image_bytes(client: httpx.AsyncClient, url: str) -> bytes | N
     return None
 
 
-async def extract_cards_from_current_page(page: Page) -> list[dict]:
+async def extract_cards_from_current_page(page: Page, known: list[str]) -> list[dict]:
     """
     Solution #1: Extracts all comic cards AND clicks the website's own 'READ' button
     for multi-page comics to pull the English-translated images directly from uma-index.top.
+    `known` = cached post ids: their READ modal is skipped (already resolved, saves time).
+    Only buttons that appear WITH the modal are clicked, so the site's own pagination
+    'Next' button is never hit by accident (that used to flip the page mid-scan).
     """
     return await page.evaluate(
         r"""
-        async () => {
+        async (known) => {
             const sleep = ms => new Promise(r => setTimeout(r, ms));
             const src = img => img.currentSrc || img.src || img.getAttribute('data-src');
+            const btns = () => Array.from(document.querySelectorAll('button, [role="button"]'));
             const results = [];
             const xLinks = Array.from(document.querySelectorAll('a[href*="x.com/"], a[href*="twitter.com/"]'))
                 .filter(a => /\/status\/\d+/.test(a.href));
@@ -290,6 +305,7 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
                 }
                 if (!card) continue;
 
+                const tid = (link.href.match(/status\/(\d+)/) || [])[1];
                 const rawText = card.innerText || '';
                 const pageMatch = rawText.match(/\b(\d+)P\b/);
                 const expectedPages = pageMatch ? parseInt(pageMatch[1], 10) : 1;
@@ -299,9 +315,10 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
                 const readBtn = Array.from(card.querySelectorAll('button, a, [role="button"], span'))
                     .find(el => (el.innerText || '').trim().toUpperCase() === 'READ');
 
-                if (readBtn && (expectedPages > 1 || cardImgs.length === 0)) {
+                if (readBtn && !known.includes(tid) && (expectedPages > 1 || cardImgs.length === 0)) {
                     try {
                         const beforeImgs = new Set(Array.from(document.querySelectorAll('img')).map(src));
+                        const beforeBtns = new Set(btns());
                         readBtn.click();
                         await sleep(350);
 
@@ -314,11 +331,11 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
                         collectNewImgs();
 
                         for (let p = 1; p < expectedPages; p++) {
-                            const nextModalBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
-                                .find(b => {
-                                    const t = (b.innerText || b.getAttribute('aria-label') || '').toUpperCase();
-                                    return t === '>' || t === '›' || t === '→' || t.includes('NEXT');
-                                });
+                            const nextModalBtn = btns().find(b => {
+                                if (beforeBtns.has(b)) return false;
+                                const t = (b.innerText || b.getAttribute('aria-label') || '').toUpperCase();
+                                return t === '>' || t === '›' || t === '→' || t.includes('NEXT');
+                            });
                             if (!nextModalBtn) break;
                             nextModalBtn.click();
                             await sleep(250);
@@ -326,8 +343,8 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
                         }
 
                         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-                        const closeBtn = Array.from(document.querySelectorAll('button, [role="button"]'))
-                            .find(b => ['×', '✕', 'X', 'CLOSE'].includes((b.innerText || b.getAttribute('aria-label') || '').trim().toUpperCase()));
+                        const closeBtn = btns().find(b => !beforeBtns.has(b) &&
+                            ['×', '✕', 'X', 'CLOSE'].includes((b.innerText || b.getAttribute('aria-label') || '').trim().toUpperCase()));
                         if (closeBtn) closeBtn.click();
                         await sleep(150);
                     } catch (e) {}
@@ -342,7 +359,8 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
             }
             return results;
         }
-        """
+        """,
+        known,
     )
 
 
@@ -413,11 +431,12 @@ def parse_card(raw_text: str) -> dict:
 
 async def scrape_uma_index_pages(store: PostStore) -> list[UmaComicPost]:
     """
-    Scrapes pages 1..MAX_PAGES (newest -> oldest). Uses direct site images first,
-    falling back to X resolvers only when needed.
+    Scrapes pages 1..MAX_PAGES (newest -> oldest). The tweet's own photo list is the
+    source of truth for images; what the site showed is only the fallback.
     """
     raw_cards: list[dict] = []
     api_url_map: dict[str, list[str]] = {}
+    known = store.get_cached_ids()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -442,7 +461,7 @@ async def scrape_uma_index_pages(store: PostStore) -> list[UmaComicPost]:
         await page.wait_for_timeout(2500)
 
         for n in range(1, MAX_PAGES + 1):
-            cards = await extract_cards_from_current_page(page)
+            cards = await extract_cards_from_current_page(page, known)
             if not cards:
                 logger.warning(f"No cards found on page {n}, stopping pagination.")
                 break
@@ -453,33 +472,34 @@ async def scrape_uma_index_pages(store: PostStore) -> list[UmaComicPost]:
                 break
         await browser.close()
 
-    seen: set[str] = set()
+    seen: set[str] = set()  # keyed by post id: x.com / twitter.com / ?s=20 variants of one tweet are one post
     posts: list[UmaComicPost] = []
 
     async with httpx.AsyncClient(follow_redirects=True, headers=API_HEADERS) as client:
         for item in raw_cards:
             tweet_url = (item.get("tweetUrl") or "").strip()
-            if not tweet_url or tweet_url in seen:
-                continue
-            seen.add(tweet_url)
-
             match = TWEET_ID_REGEX.search(tweet_url)
             post_id = match.group(1) if match else tweet_url
+            if not tweet_url or post_id in seen:
+                continue
+            seen.add(post_id)
 
+            expected_pages = item.get("expectedPages") or 1
+
+            # A cached post with fewer pages than the site announces is stale (single-image bug): re-resolve it
             cached = store.get_cached_post(post_id)
-            if cached and cached.image_urls:
+            if cached and len(cached.image_urls) >= expected_pages:
                 posts.append(cached)
                 continue
 
-            images = [u for u in map(upgrade_twimg_url, item.get("siteImgs") or []) if u]
-            if (mapped := api_url_map.get(post_id)) and len(mapped) >= len(images):
-                images = mapped
-
-            expected_pages = item.get("expectedPages") or 1
-            if len(images) < expected_pages:
-                resolved = await resolve_tweet_images(client, tweet_url)
-                if len(resolved) > len(images):
-                    images = resolved[:expected_pages]
+            images = await resolve_tweet_images(client, tweet_url, expected_pages)
+            if not images:  # X resolvers all down: fall back to what the site itself showed
+                images = api_url_map.get(post_id) or [
+                    u for u in map(upgrade_twimg_url, item.get("siteImgs") or []) if u
+                ]
+                if len(images) < expected_pages:  # never send half a comic: skipped and retried next scan
+                    logger.warning(f"Post {post_id} looks incomplete ({len(images)}/{expected_pages} pages), retrying next scan.")
+                    continue
 
             if images:
                 post = UmaComicPost(
@@ -519,16 +539,17 @@ def format_caption(post: UmaComicPost) -> str:
 
 
 async def safe_telegram_call(coro_func, *args, **kwargs):
-    """Catches RetryAfter (429 FloodWait) and timeouts, sleeping the required time before retrying."""
+    """
+    Retries ONLY on RetryAfter (429 FloodWait: the message was definitely not sent).
+    TimedOut is deliberately NOT retried: the upload may already have reached Telegram,
+    and a blind retry is what posted the same comic several times.
+    """
     for _ in range(5):
         try:
             return await coro_func(*args, **kwargs)
         except RetryAfter as exc:
             logger.warning(f"Telegram FloodWait triggered! Pausing for {exc.retry_after + 2:.1f}s...")
             await asyncio.sleep(exc.retry_after + 2.0)
-        except TimedOut:
-            logger.warning("Telegram request timed out, retrying in 4s...")
-            await asyncio.sleep(4.0)
 
 
 async def send_comic_post(
@@ -588,8 +609,8 @@ async def send_comic_post(
     except Forbidden:
         logger.warning(f"Bot blocked or kicked from {chat_id}. Removing subscriber.")
         store.remove_subscriber(chat_id)
-    except Exception as exc:
-        logger.error(f"Failed to send post {post.post_id} to {chat_id}: {exc}")
+    except Exception as exc:  # includes TimedOut: not marked delivered, so it is retried next scan
+        logger.error(f"Failed to send post {post.post_id} to {chat_id}: {exc!r}")
     return 0
 
 
@@ -727,7 +748,13 @@ def main():
     if TARGET_CHAT_ID:
         store.add_subscriber(TARGET_CHAT_ID, title="Configured Target", chat_type="channel")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Generous timeouts: the PTB default (5s) is too short for uploading several original-quality
+    # images, and every timeout used to trigger a retry that re-posted the same comic.
+    app = (
+        Application.builder().token(BOT_TOKEN)
+        .connect_timeout(30).read_timeout(60).write_timeout(180).pool_timeout(30)
+        .build()
+    )
     app.bot_data.update(store=store, sync_lock=asyncio.Lock())
 
     app.add_handler(CommandHandler("start", cmd_start))
