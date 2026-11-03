@@ -540,9 +540,11 @@ async def send_comic_post(
     """
     caption = format_caption(post)
 
-    photos = [
-        b for b in await asyncio.gather(*(download_image_bytes(http_client, u) for u in post.image_urls[:10])) if b
-    ]
+    downloaded = await asyncio.gather(*(download_image_bytes(http_client, u) for u in post.image_urls[:10]))
+    if any(photo is None for photo in downloaded):
+        logger.warning(f"Could not download all image bytes for post {post.post_id}")
+        return -1
+    photos = [photo for photo in downloaded if photo is not None]
     if not photos:
         logger.warning(f"Could not download image bytes for post {post.post_id}: {post.image_urls}")
         return -1
