@@ -84,7 +84,7 @@ Open your bot in Telegram, send `/start`, and the comics you have not received y
 
 ---
 
-## Windows Shortcuts
+## Windows Shortcuts (⚠️RUN AT YOUR OWN RISKS⚠️)
 
 - `setup.bat` creates `.venv`, installs the requirements and installs Chromium (RUN ONLY ONCE).
 - `autorun.bat` goes to its own folder, activates `.venv` and starts the bot. Double-click it, or put a shortcut in the Startup folder to launch the bot at login.
