@@ -13,7 +13,7 @@ from telegram import (
     ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter
+from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut
 from telegram.ext import (
     Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes,
 )
@@ -39,6 +39,9 @@ POLL_INTERVAL_SECONDS = 60 * 60  # Check the window every 60 minutes
 SLEEP_BETWEEN_POSTS = 4.5        # Minimum delay (seconds) between posts
 SECONDS_PER_MEDIA_ITEM = 4       # Ensures multi-image albums stay strictly < 20 msgs/min
 SLEEP_BETWEEN_USERS = 0.4        # Delay between sending to different users
+# Images are sent BY URL: Telegram's servers download them, so nothing is uploaded from this PC.
+# The request only waits for Telegram to fetch the images, hence the generous read timeout.
+SEND_TIMEOUTS = dict(connect_timeout=30, read_timeout=90, write_timeout=60, pool_timeout=30)
 
 # =====================================================================
 # COLORED LOGGING (COLORS ONLY TIMESTAMP + LEVEL), TOKEN REDACTED
@@ -74,7 +77,7 @@ logger = logging.getLogger("UmaIndexBot")
 
 
 # =====================================================================
-# DATA MODEL & SQLITE STORE (SUGGESTION B: AUTO-MIGRATION & CACHE PURGE)
+# DATA MODEL & SQLITE STORE (POST CACHE + PER-USER DELIVERY TRACKING)
 # =====================================================================
 @dataclass
 class UmaComicPost:
@@ -90,6 +93,9 @@ class UmaComicPost:
 class PostStore:
     def __init__(self, path: str):
         self.db = sqlite3.connect(path)
+        # posts_cache is only a cache: an old-schema table (pre 'data' column) is simply rebuilt
+        if (cols := {r[1] for r in self.q("PRAGMA table_info(posts_cache)")}) and "data" not in cols:
+            self.q("DROP TABLE posts_cache")
         self.q("CREATE TABLE IF NOT EXISTS posts_cache (post_id TEXT PRIMARY KEY, data TEXT)")
         self.q("CREATE TABLE IF NOT EXISTS subscribers (chat_id TEXT PRIMARY KEY, chat_title TEXT, chat_type TEXT)")
         self.q(
@@ -103,9 +109,9 @@ class PostStore:
 
     def _auto_heal_database(self):
         """
-        Suggestion B: Automatic Startup Migration & Poisoned-Cache Purge.
+        Automatic Startup Migration & Poisoned-Cache Purge.
         1. Upgrades existing user_deliveries table with 'status' column if missing.
-        2. Purges poisoned cache entries (missing/non-http URLs or old unverified fallbacks).
+        2. Purges poisoned cache entries (missing/non-http URLs).
         3. Resets any 'try_again' rows on startup so they get a fresh attempt on boot,
            while never retrying during the polling loop.
         """
@@ -138,9 +144,6 @@ class PostStore:
     def get_cached_post(self, post_id: str) -> UmaComicPost | None:
         rows = self.q("SELECT data FROM posts_cache WHERE post_id = ?", post_id)
         return UmaComicPost(**json.loads(rows[0][0])) if rows else None
-
-    def get_cached_ids(self) -> list[str]:
-        return [r[0] for r in self.q("SELECT post_id FROM posts_cache")]
 
     def save_post_to_cache(self, post: UmaComicPost):
         self.q("INSERT OR REPLACE INTO posts_cache VALUES (?, ?)", post.post_id, json.dumps(asdict(post)))
@@ -187,24 +190,17 @@ class PostStore:
 
 
 # =====================================================================
-# SOLUTION #1 & #2: DIRECT SITE SCRAPER + IN-MEMORY IMAGE DOWNLOADER
+# PLAYWRIGHT SCRAPER & MULTI-FALLBACK HIGH-RES IMAGE RESOLVER
 # =====================================================================
 TWEET_ID_REGEX = re.compile(r"(?:twitter\.com|x\.com)/[^/]+/status/(\d+)")
-IMG_URL_REGEX = re.compile(
-    r'https?://[^\s"\'<>]+?(?:pbs\.twimg\.com/media/[^\s"\'<>]+|\.(?:jpg|jpeg|png|webp))'
-)
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-)
-BROWSER_HEADERS = {
-    "User-Agent": UA,
-    "Referer": "https://www.uma-index.top/",
-    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+# Custom headers so FxTwitter / VxTwitter Cloudflare firewalls do not return 403 Forbidden
+API_HEADERS = {
+    "User-Agent": "UmaIndexTelegramBot/2.0 (+https://www.uma-index.top)",
+    "Accept": "application/json",
 }
-API_HEADERS = {"User-Agent": UA, "Accept": "application/json"}
 
+# 3-tier fallback chain: (url builder, photo extractor)
 RESOLVERS = [
     (  # 1. FxTwitter API
         lambda i: f"https://api.fxtwitter.com/status/{i}",
@@ -222,7 +218,7 @@ RESOLVERS = [
 
 
 def upgrade_twimg_url(url: str) -> str:
-    """Resolves relative uma-index URLs and forces pbs.twimg.com URLs to load original quality."""
+    """Makes site-relative urls absolute, drops blob/data urls, forces pbs.twimg.com to original quality."""
     if not url or url.startswith(("blob:", "data:")):
         return ""
     if url.startswith("/"):
@@ -234,8 +230,9 @@ def upgrade_twimg_url(url: str) -> str:
 
 async def resolve_tweet_images(client: httpx.AsyncClient, tweet_url: str, expected: int = 1) -> list[str]:
     """
-    Resolves every photo of the tweet, in order. A tier that returns fewer photos than
-    the site announced (e.g. 1 of 2) is not trusted: the next tier is tried, best result wins.
+    Resolves every photo of the tweet (1-4 translated pages), in order. A tier that returns
+    fewer photos than the card announced (e.g. 1 of 2) is not trusted: the next tier is
+    tried and the best result wins.
     """
     match = TWEET_ID_REGEX.search(tweet_url)
     if not match:
@@ -256,40 +253,11 @@ async def resolve_tweet_images(client: httpx.AsyncClient, tweet_url: str, expect
     return best
 
 
-async def download_image_bytes(client: httpx.AsyncClient, url: str) -> bytes | None:
-    """
-    Solution #2: Downloads image bytes into memory in Python with browser headers
-    so Telegram never fails with 'Failed to get http url content'.
-    Raw bytes (not BytesIO): a retried upload would otherwise re-read an exhausted stream.
-    """
-    clean_url = upgrade_twimg_url(url)
-    if not clean_url:
-        return None
-    for candidate in dict.fromkeys([clean_url, url]):
-        try:
-            resp = await client.get(candidate, headers=BROWSER_HEADERS, timeout=20.0)
-            ctype = resp.headers.get("content-type", "").lower()
-            if resp.status_code == 200 and len(resp.content) > 512 and ("image" in ctype or "octet-stream" in ctype):
-                return resp.content
-        except Exception as exc:
-            logger.debug(f"Image byte download failed for {candidate}: {exc}")
-    return None
-
-
-async def extract_cards_from_current_page(page: Page, known: list[str]) -> list[dict]:
-    """
-    Solution #1: Extracts all comic cards AND clicks the website's own 'READ' button
-    for multi-page comics to pull the English-translated images directly from uma-index.top.
-    `known` = cached post ids: their READ modal is skipped (already resolved, saves time).
-    Only buttons that appear WITH the modal are clicked, so the site's own pagination
-    'Next' button is never hit by accident (that used to flip the page mid-scan).
-    """
+async def extract_cards_from_current_page(page: Page) -> list[dict]:
+    """Extracts all comic cards visible on the currently rendered DOM page."""
     return await page.evaluate(
         r"""
-        async (known) => {
-            const sleep = ms => new Promise(r => setTimeout(r, ms));
-            const src = img => img.currentSrc || img.src || img.getAttribute('data-src');
-            const btns = () => Array.from(document.querySelectorAll('button, [role="button"]'));
+        () => {
             const results = [];
             const xLinks = Array.from(document.querySelectorAll('a[href*="x.com/"], a[href*="twitter.com/"]'))
                 .filter(a => /\/status\/\d+/.test(a.href));
@@ -303,64 +271,17 @@ async def extract_cards_from_current_page(page: Page, known: list[str]) -> list[
                     card = card.parentElement;
                     depth++;
                 }
-                if (!card) continue;
 
-                const tid = (link.href.match(/status\/(\d+)/) || [])[1];
-                const rawText = card.innerText || '';
-                const pageMatch = rawText.match(/\b(\d+)P\b/);
-                const expectedPages = pageMatch ? parseInt(pageMatch[1], 10) : 1;
-                const cardImgs = Array.from(card.querySelectorAll('img')).map(src).filter(Boolean);
-
-                let modalImgs = [];
-                const readBtn = Array.from(card.querySelectorAll('button, a, [role="button"], span'))
-                    .find(el => (el.innerText || '').trim().toUpperCase() === 'READ');
-
-                if (readBtn && !known.includes(tid) && (expectedPages > 1 || cardImgs.length === 0)) {
-                    try {
-                        const beforeImgs = new Set(Array.from(document.querySelectorAll('img')).map(src));
-                        const beforeBtns = new Set(btns());
-                        readBtn.click();
-                        await sleep(350);
-
-                        const collectNewImgs = () => {
-                            for (const img of document.querySelectorAll('img')) {
-                                const s = src(img);
-                                if (s && !beforeImgs.has(s) && !modalImgs.includes(s)) modalImgs.push(s);
-                            }
-                        };
-                        collectNewImgs();
-
-                        for (let p = 1; p < expectedPages; p++) {
-                            const nextModalBtn = btns().find(b => {
-                                if (beforeBtns.has(b)) return false;
-                                const t = (b.innerText || b.getAttribute('aria-label') || '').toUpperCase();
-                                return t === '>' || t === '›' || t === '→' || t.includes('NEXT');
-                            });
-                            if (!nextModalBtn) break;
-                            nextModalBtn.click();
-                            await sleep(250);
-                            collectNewImgs();
-                        }
-
-                        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-                        const closeBtn = btns().find(b => !beforeBtns.has(b) &&
-                            ['×', '✕', 'X', 'CLOSE'].includes((b.innerText || b.getAttribute('aria-label') || '').trim().toUpperCase()));
-                        if (closeBtn) closeBtn.click();
-                        await sleep(150);
-                    } catch (e) {}
-                }
-
+                const imgEl = card ? card.querySelector('img') : null;
                 results.push({
                     tweetUrl: link.href,
-                    siteImgs: modalImgs.length ? modalImgs : cardImgs,
-                    expectedPages: expectedPages,
-                    rawText: rawText
+                    imgSrc: imgEl ? (imgEl.currentSrc || imgEl.src || imgEl.getAttribute('data-src')) : null,
+                    rawText: card ? card.innerText : ''
                 });
             }
             return results;
         }
-        """,
-        known,
+        """
     )
 
 
@@ -431,37 +352,27 @@ def parse_card(raw_text: str) -> dict:
 
 async def scrape_uma_index_pages(store: PostStore) -> list[UmaComicPost]:
     """
-    Scrapes pages 1..MAX_PAGES (newest -> oldest). The tweet's own photo list is the
-    source of truth for images; what the site showed is only the fallback.
+    Scrapes pages 1..MAX_PAGES (newest -> oldest). The tweet's own photo list is the source of
+    truth for images; the card thumbnail is only a fallback, and only for single-page comics.
+    SQLite cache means previously resolved tweets don't re-query the external APIs.
     """
     raw_cards: list[dict] = []
-    api_url_map: dict[str, list[str]] = {}
-    known = store.get_cached_ids()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await (await browser.new_context(user_agent=UA)).new_page()
-
-        async def capture_site_json(response):
-            if "json" not in response.headers.get("content-type", "").lower():
-                return
-            try:
-                text = await response.text()
-                for m in re.finditer(r'"(\d{15,22})"', text):
-                    window = text[max(0, m.start() - 300): m.end() + 1200]
-                    if found := IMG_URL_REGEX.findall(window):
-                        api_url_map[m.group(1)] = [u for u in map(upgrade_twimg_url, dict.fromkeys(found)) if u]
-            except Exception:
-                pass
-
-        page.on("response", capture_site_json)
+        page = await (await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+            )
+        )).new_page()
 
         logger.info(f"Scanning up to {MAX_PAGES} pages from {UMA_INDEX_URL} ...")
         await page.goto(UMA_INDEX_URL, wait_until="networkidle", timeout=45000)
         await page.wait_for_timeout(2500)
 
         for n in range(1, MAX_PAGES + 1):
-            cards = await extract_cards_from_current_page(page, known)
+            cards = await extract_cards_from_current_page(page)
             if not cards:
                 logger.warning(f"No cards found on page {n}, stopping pagination.")
                 break
@@ -484,37 +395,36 @@ async def scrape_uma_index_pages(store: PostStore) -> list[UmaComicPost]:
                 continue
             seen.add(post_id)
 
-            expected_pages = item.get("expectedPages") or 1
+            raw_text = item.get("rawText") or ""
+            expected = int(m.group(1)) if (m := re.search(r"\b(\d+)P\b", raw_text)) else 1  # "2P" badge on the card
 
-            # A cached post with fewer pages than the site announces is stale (single-image bug): re-resolve it
+            # A cached post with fewer pages than the card announces is stale: re-resolve it
             cached = store.get_cached_post(post_id)
-            if cached and len(cached.image_urls) >= expected_pages:
+            if cached and len(cached.image_urls) >= expected:
                 posts.append(cached)
                 continue
 
-            images = await resolve_tweet_images(client, tweet_url, expected_pages)
-            if not images:  # X resolvers all down: fall back to what the site itself showed
-                images = api_url_map.get(post_id) or [
-                    u for u in map(upgrade_twimg_url, item.get("siteImgs") or []) if u
-                ]
-                if len(images) < expected_pages:  # never send half a comic: skipped and retried next scan
-                    logger.warning(f"Post {post_id} looks incomplete ({len(images)}/{expected_pages} pages), retrying next scan.")
-                    continue
+            images = await resolve_tweet_images(client, tweet_url, expected)
+            if not images and expected <= 1 and (thumb := upgrade_twimg_url(item.get("imgSrc") or "")):
+                images = [thumb]
+            if not images:  # never send a thumbnail for a multi-page comic: retried next scan
+                logger.warning(f"No images resolved for post {post_id} ({expected}P), retrying next scan.")
+                continue
+            if len(images) < expected:
+                logger.warning(f"Post {post_id}: tweet exposes {len(images)} of {expected} pages.")
 
-            if images:
-                post = UmaComicPost(
-                    post_id=post_id, tweet_url=tweet_url, image_urls=images[:4],
-                    **parse_card(item.get("rawText") or ""),
-                )
-                store.save_post_to_cache(post)
-                posts.append(post)
-                await asyncio.sleep(0.15)
+            post = UmaComicPost(
+                post_id=post_id, tweet_url=tweet_url, image_urls=images, **parse_card(raw_text),
+            )
+            store.save_post_to_cache(post)
+            posts.append(post)
+            await asyncio.sleep(0.25)  # brief pause when hitting the APIs for brand-new posts
 
     return posts
 
 
 # =====================================================================
-# TELEGRAM SENDER (IN-MEMORY BYTE UPLOAD) & "DONE READING" UI
+# TELEGRAM SENDER (SENT BY URL) WITH RATE-LIMIT PROTECTION & "DONE READING" UI
 # =====================================================================
 def done_keyboard(message_ids: list[int] = ()) -> InlineKeyboardMarkup:
     # Callback data is capped at 64 bytes, so ids are sent as offsets from the first id
@@ -541,7 +451,7 @@ def format_caption(post: UmaComicPost) -> str:
 async def safe_telegram_call(coro_func, *args, **kwargs):
     """
     Retries ONLY on RetryAfter (429 FloodWait: the message was definitely not sent).
-    TimedOut is deliberately NOT retried: the upload may already have reached Telegram,
+    TimedOut is deliberately NOT retried: Telegram may already have posted the message,
     and a blind retry is what posted the same comic several times.
     """
     for _ in range(5):
@@ -552,66 +462,69 @@ async def safe_telegram_call(coro_func, *args, **kwargs):
             await asyncio.sleep(exc.retry_after + 2.0)
 
 
-async def send_comic_post(
-    bot, store: PostStore, http_client: httpx.AsyncClient, chat_id, post: UmaComicPost
-) -> int:
+async def send_photos(bot, chat_id, caption: str, photos: list[str], character: str) -> int:
+    """One photo -> 1 message. 2-10 photos -> album + 1 'Done reading' control message."""
+    if len(photos) == 1:
+        sent = await safe_telegram_call(
+            bot.send_photo, chat_id=chat_id, photo=photos[0], caption=caption,
+            parse_mode=ParseMode.HTML, reply_markup=done_keyboard(), **SEND_TIMEOUTS,
+        )
+        return 1 if sent else 0
+
+    media = [
+        InputMediaPhoto(url, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML if i == 0 else None)
+        for i, url in enumerate(photos)
+    ]
+    sent = await safe_telegram_call(bot.send_media_group, chat_id=chat_id, media=media, **SEND_TIMEOUTS)
+    if not sent:
+        return 0
+
+    ids = [m.message_id for m in sent]
+    await asyncio.sleep(1.2)
+    try:  # the album is already delivered: a failure here must never cause a re-send
+        control = await safe_telegram_call(
+            bot.send_message, chat_id=chat_id,
+            text=f"📖 <i>{character} ({len(photos)}P)</i> — Tap below when finished:",
+            parse_mode=ParseMode.HTML, reply_to_message_id=ids[0], reply_markup=done_keyboard(ids),
+        )
+    except Exception as exc:
+        logger.warning(f"Album delivered, but control message failed: {exc}")
+        return len(photos)
+    return len(photos) + (1 if control else 0)
+
+
+async def send_comic_post(bot, store: PostStore, chat_id, post: UmaComicPost) -> int:
     """
-    Downloads image bytes locally and uploads them to Telegram.
-    Returns messages sent (>0), 0 for transient failure, or -1 to label as 'try_again'.
+    Sends the comic to `chat_id` by URL. Returns messages sent (>0), 0 for a transient
+    failure (retried next scan), or -1 if Telegram rejects the images (label 'try_again').
+    Telegram refuses url-photos over 5 MB or with extreme dimensions, so a rejected post is
+    retried once with the smaller 'large' rendition before giving up.
     """
     caption = format_caption(post)
+    urls = post.image_urls[:10]
+    variants = [urls, [u.replace("name=orig", "name=large") for u in urls]]
 
-    downloaded = await asyncio.gather(*(download_image_bytes(http_client, u) for u in post.image_urls[:10]))
-    if any(photo is None for photo in downloaded):
-        logger.warning(f"Could not download all image bytes for post {post.post_id}")
-        return -1
-    photos = [photo for photo in downloaded if photo is not None]
-    if not photos:
-        logger.warning(f"Could not download image bytes for post {post.post_id}: {post.image_urls}")
-        return -1
-
-    try:
-        if len(photos) == 1:
-            sent = await safe_telegram_call(
-                bot.send_photo, chat_id=chat_id, photo=photos[0], caption=caption,
-                parse_mode=ParseMode.HTML, reply_markup=done_keyboard(),
-            )
-            count = 1 if sent else 0
-        else:
-            media = [
-                InputMediaPhoto(photo, caption=caption if i == 0 else None,
-                                parse_mode=ParseMode.HTML if i == 0 else None)
-                for i, photo in enumerate(photos)
-            ]
-            sent = await safe_telegram_call(bot.send_media_group, chat_id=chat_id, media=media)
-            count = 0
-            if sent:
-                ids = [m.message_id for m in sent]
-                count = len(photos)
-                await asyncio.sleep(1.2)
-                try:
-                    control = await safe_telegram_call(
-                        bot.send_message, chat_id=chat_id,
-                        text=f"📖 <i>{post.character} ({len(photos)}P)</i> — Tap below when finished:",
-                        parse_mode=ParseMode.HTML, reply_to_message_id=ids[0],
-                        reply_markup=done_keyboard(ids),
-                    )
-                    if control:
-                        count += 1
-                except Exception as exc:
-                    logger.warning(f"Media group delivered for post {post.post_id}, but control message failed: {exc}")
-        if count:
-            logger.success(f"Sent [{post.character}] ({post.post_id}, {len(photos)}P) -> chat {chat_id}")
-        return count
-    except BadRequest as exc:
-        logger.warning(f"Skipping post {post.post_id}: Telegram BadRequest ({exc})")
-        return -1
-    except Forbidden:
-        logger.warning(f"Bot blocked or kicked from {chat_id}. Removing subscriber.")
-        store.remove_subscriber(chat_id)
-    except Exception as exc:  # includes TimedOut: not marked delivered, so it is retried next scan
-        logger.error(f"Failed to send post {post.post_id} to {chat_id}: {exc!r}")
-    return 0
+    for n, photos in enumerate(variants):
+        if n and photos == variants[0]:
+            break  # no smaller rendition exists for these urls
+        try:
+            count = await send_photos(bot, chat_id, caption, photos, post.character)
+            if count:
+                logger.success(f"Sent [{post.character}] ({post.post_id}, {len(photos)}P) -> chat {chat_id}")
+            return count
+        except BadRequest as exc:
+            logger.warning(f"Telegram rejected post {post.post_id} ({exc})" + (", retrying smaller..." if n == 0 else ""))
+        except Forbidden:
+            logger.warning(f"Bot blocked or kicked from {chat_id}. Removing subscriber.")
+            store.remove_subscriber(chat_id)
+            return 0
+        except TimedOut:  # not retried here: it may have been delivered, so no blind re-send
+            logger.warning(f"Telegram timed out on post {post.post_id}; it will be re-checked next scan.")
+            return 0
+        except Exception as exc:
+            logger.error(f"Failed to send post {post.post_id} to {chat_id}: {exc!r}")
+            return 0
+    return -1
 
 
 # =====================================================================
@@ -635,21 +548,20 @@ async def sync_to_subscribers(application: Application, target_chat_id=None):
             logger.warning(f"No posts extracted during {MAX_PAGES}-page scan.")
             return
 
-        async with httpx.AsyncClient(follow_redirects=True) as http_client:
-            for post in reversed(posts):  # oldest first, so chats read in order
-                active = set(store.get_subscribers())
-                for chat_id in targets:
-                    if chat_id not in active or store.is_delivered(chat_id, post.post_id):
-                        continue
-                    sent = await send_comic_post(application.bot, store, http_client, chat_id, post)
-                    if sent > 0:
-                        store.mark(chat_id, post.post_id)
-                    elif sent == -1:
-                        # Labelled 'try_again' in DB: ignored by polls, retried on next bot startup or /start
-                        store.mark(chat_id, post.post_id, "try_again")
-                    await asyncio.sleep(
-                        max(SLEEP_BETWEEN_POSTS, sent * SECONDS_PER_MEDIA_ITEM) if sent > 0 else SLEEP_BETWEEN_USERS
-                    )
+        for post in reversed(posts):  # oldest first, so chats read in order
+            active = set(store.get_subscribers())
+            for chat_id in targets:
+                if chat_id not in active or store.is_delivered(chat_id, post.post_id):
+                    continue
+                sent = await send_comic_post(application.bot, store, chat_id, post)
+                if sent > 0:
+                    store.mark(chat_id, post.post_id)
+                elif sent == -1:
+                    # Labelled 'try_again' in DB: ignored by polls, retried on next bot startup or /start
+                    store.mark(chat_id, post.post_id, "try_again")
+                await asyncio.sleep(
+                    max(SLEEP_BETWEEN_POSTS, sent * SECONDS_PER_MEDIA_ITEM) if sent > 0 else SLEEP_BETWEEN_USERS
+                )
 
 
 # =====================================================================
@@ -748,11 +660,9 @@ def main():
     if TARGET_CHAT_ID:
         store.add_subscriber(TARGET_CHAT_ID, title="Configured Target", chat_type="channel")
 
-    # Generous timeouts: the PTB default (5s) is too short for uploading several original-quality
-    # images, and every timeout used to trigger a retry that re-posted the same comic.
     app = (
         Application.builder().token(BOT_TOKEN)
-        .connect_timeout(30).read_timeout(60).write_timeout(180).pool_timeout(30)
+        .connect_timeout(30).read_timeout(60).write_timeout(60).pool_timeout(30)
         .build()
     )
     app.bot_data.update(store=store, sync_lock=asyncio.Lock())
@@ -764,13 +674,14 @@ def main():
     app.add_handler(ChatMemberHandler(track_bot_chats, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(handle_done_reading, pattern=r"^del:"))
 
+    # Runs 5 seconds after startup (catching up on posts missed while deactivated), then every POLL_INTERVAL_SECONDS
     app.job_queue.run_repeating(
         lambda ctx: sync_to_subscribers(ctx.application),
         interval=POLL_INTERVAL_SECONDS, first=5, name="uma_index_poller",
         job_kwargs={"max_instances": 1},
     )
 
-    logger.info("Starting Uma-Index Bot (Direct Modal Scraper + Byte Upload + Startup Auto-Heal)...")
+    logger.info("Starting Uma-Index Bot (URL sending + API-first image resolver)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
