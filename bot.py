@@ -31,10 +31,11 @@ UMA_INDEX_URL = "https://www.uma-index.top/?mode=twitter"
 DB_PATH = "uma_seen.db"
 
 # =====================================================================
-# PAGE WINDOW & ANTI-JAM RATE LIMIT SETTINGS
+# PAGE WINDOW (MIN_PAGES .. MAX_PAGES) & ANTI-JAM RATE LIMIT SETTINGS
 # =====================================================================
-# Defaults to 600 pages so it crawls the entire archive (update MAX_PAGES in .env if set there)
-MAX_PAGES = max(1, int(os.getenv("MAX_PAGES", "600")))
+_min_p = max(1, int(os.getenv("MIN_PAGES", "1")))
+_max_p = max(1, int(os.getenv("MAX_PAGES", "600")))
+MIN_PAGES, MAX_PAGES = min(_min_p, _max_p), max(_min_p, _max_p)
 
 POLL_INTERVAL_SECONDS = 60 * 60  # Check the window every 60 minutes
 SLEEP_BETWEEN_POSTS = 4.5        # Minimum delay (seconds) between posts
@@ -259,7 +260,7 @@ async def resolve_tweet_images(client: httpx.AsyncClient, tweet_url: str, expect
 
 
 async def extract_cards_from_current_page(page: Page) -> list[dict]:
-    """Extracts all comic cards visible on the currently rendered DOM page."""
+    """Extracts all comic cards visible on the currently rendered DOM page (top-to-bottom)."""
     return await page.evaluate(
         r"""
         () => {
@@ -290,54 +291,120 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
     )
 
 
-async def go_to_next_page(page: Page, target_page_num: int, prev_first_url: str) -> bool:
+async def get_detected_max_page(page: Page) -> int:
     """
-    Clicks the pagination Next / page-number button, then falls back to
-    ?mode=twitter&page=N if needed. True once the first card has changed.
+    Reads the pagination footer (e.g. '1 2 3 ... 488 Next' or '/ 488 Go') to detect the
+    actual last page on uma-index.top so MAX_PAGES=600 can clamp cleanly to the real last page.
     """
-    clicked = await page.evaluate(
-        """
-        (targetPage) => {
-            const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], span, li'));
-            for (const el of candidates) {
-                const txt = (el.innerText || el.textContent || '').trim().toUpperCase();
-                const aria = (el.getAttribute('aria-label') || '').toUpperCase();
-                if (['NEXT', 'NEXT >', '>', '»', '→'].includes(txt) || aria.includes('NEXT')) {
-                    if (!el.disabled && !el.classList.contains('disabled')) { el.click(); return true; }
+    detected = await page.evaluate(
+        r"""
+        () => {
+            let maxP = 1;
+            const bodyText = document.body ? document.body.innerText : '';
+            const slashMatch = bodyText.match(/\/\s*(\d+)\s*Go/i);
+            if (slashMatch) maxP = Math.max(maxP, parseInt(slashMatch[1], 10));
+
+            const els = Array.from(document.querySelectorAll('button, a, [role="button"], span, li'));
+            for (const el of els) {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (/^\d+$/.test(txt)) {
+                    const num = parseInt(txt, 10);
+                    if (num > maxP && num <= 5000) maxP = num;
                 }
             }
+            return maxP;
+        }
+        """
+    )
+    return max(1, int(detected or 1))
+
+
+async def go_to_page(page: Page, target_page_num: int, prev_first_url: str, current_page_num: int | None = None) -> bool:
+    """
+    Navigates directly to `target_page_num` (supporting reverse order e.g. 7 -> 6 -> 5 -> 4).
+    Tries:
+      1. Exact page-number button or 'Previous' button (if stepping backward by 1)
+      2. The 'Go to: [input] Go' box in the pagination bar
+      3. Direct URL navigation (?mode=twitter&page=N)
+    """
+    is_prev_step = current_page_num is not None and target_page_num == current_page_num - 1
+
+    clicked = await page.evaluate(
+        """
+        ({ targetPage, isPrevStep }) => {
+            const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], span, li'));
+
+            // 1. Try clicking exact page number button
             for (const el of candidates) {
-                if ((el.innerText || el.textContent || '').trim() === String(targetPage) && !el.disabled) {
-                    el.click(); return true;
+                if ((el.innerText || el.textContent || '').trim() === String(targetPage) && !el.disabled && !el.classList.contains('disabled')) {
+                    el.click();
+                    return true;
+                }
+            }
+
+            // 2. If stepping backward by 1 (e.g. 7 -> 6), try clicking Previous button
+            if (isPrevStep) {
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').trim().toUpperCase();
+                    const aria = (el.getAttribute('aria-label') || '').toUpperCase();
+                    if (['PREV', 'PREVIOUS', '< PREV', '< PREVIOUS', '<', '«', '←'].includes(txt) || aria.includes('PREV')) {
+                        if (!el.disabled && !el.classList.contains('disabled')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // 3. Try using the "Go to page" numeric input + "Go" button
+            const inputs = Array.from(document.querySelectorAll('input[type="number"], input[type="text"]'));
+            for (const inp of inputs) {
+                const parentText = (inp.parentElement ? inp.parentElement.innerText : '').toUpperCase();
+                const ph = (inp.getAttribute('placeholder') || '').toUpperCase();
+                if (parentText.includes('GO') || parentText.includes('/') || ph.includes('PAGE')) {
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, String(targetPage));
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    const goBtn = Array.from((inp.parentElement || document).querySelectorAll('button, a, [role="button"]'))
+                        .find(b => (b.innerText || '').trim().toUpperCase() === 'GO');
+                    if (goBtn) {
+                        goBtn.click();
+                        return true;
+                    }
+                    inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                    return true;
                 }
             }
             return false;
         }
         """,
-        target_page_num,
+        {"targetPage": target_page_num, "isPrevStep": is_prev_step},
     )
 
-    async def first_card_changed() -> bool:
+    async def first_card_ready() -> bool:
         first_href = await page.evaluate(
             "() => (document.querySelector('a[href*=\"/status/\"]') || {}).href || ''"
         )
-        return bool(first_href) and first_href != prev_first_url
+        if not first_href:
+            return False
+        return True if not prev_first_url else first_href != prev_first_url
 
     if clicked:
         for _ in range(16):
             await page.wait_for_timeout(350)
-            if await first_card_changed():
+            if await first_card_ready():
                 return True
 
     try:
         await page.goto(f"{UMA_INDEX_URL}&page={target_page_num}", wait_until="domcontentloaded", timeout=35000)
-        for _ in range(12):
+        for _ in range(14):
             await page.wait_for_timeout(350)
-            if await first_card_changed():
+            if await first_card_ready():
                 return True
         return False
     except Exception as exc:
-        logger.warning(f"Fallback navigation to page {target_page_num} failed: {exc}")
+        logger.warning(f"Navigation to page {target_page_num} failed: {exc}")
         return False
 
 
@@ -367,9 +434,8 @@ async def resolve_page_cards(
     delivered_by_chat: dict[str, set[str]],
 ) -> list[UmaComicPost]:
     """
-    Converts one page's raw cards into UmaComicPost objects.
-    EFFICIENCY: If every target chat has ALREADY received a post_id (e.g. Pages 1-50),
-    we skip resolving it entirely so the bot flies past already-delivered pages!
+    Converts one page's raw cards into UmaComicPost objects (in top-to-bottom DOM order).
+    If every target chat has ALREADY received a post_id, skips resolving it entirely.
     """
     page_posts: list[UmaComicPost] = []
     for item in cards:
@@ -516,14 +582,13 @@ async def send_comic_post(bot, store: PostStore, chat_id, post: UmaComicPost) ->
 
 
 # =====================================================================
-# STREAMING 600-PAGE SYNC ENGINE (CRASH-SAFE & DUPLICATE-PROOF)
+# REVERSE PAGE-RANGE SYNC ENGINE (MAX_PAGES -> MIN_PAGES, BOTTOM -> UP)
 # =====================================================================
 async def sync_to_subscribers(application: Application, target_chat_id=None):
     """
-    Streams through Pages 1..MAX_PAGES (up to 600) page-by-page.
-    - Pages 1-50 that are already in `uma_seen.db` are skipped in milliseconds without calling FxTwitter/Telegram.
-    - Unseen pages (e.g. 51..600) are resolved and delivered immediately as each page is visited,
-      while strictly pacing every send against Telegram's rate limits.
+    Streams through Pages MAX_PAGES down to MIN_PAGES (e.g. Page 7 -> 6 -> 5 -> 4).
+    On each page, posts are sent from the BOTTOM of the page UPWARD (`reversed(page_posts)`),
+    so comics always arrive in true chronological order (earliest post -> latest post).
     """
     store: PostStore = application.bot_data["store"]
 
@@ -549,7 +614,7 @@ async def sync_to_subscribers(application: Application, target_chat_id=None):
                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
                     )
                 )
-                # Block unnecessary browser assets (fonts/media/stylesheets) so 600 pages load fast & light
+                # Block unnecessary browser assets (fonts/media/stylesheets) so pages load fast & light
                 await context.route(
                     "**/*",
                     lambda route: route.abort()
@@ -558,15 +623,38 @@ async def sync_to_subscribers(application: Application, target_chat_id=None):
                 )
                 page = await context.new_page()
 
-                logger.info(f"Streaming up to {MAX_PAGES} pages from {UMA_INDEX_URL} ...")
+                logger.info(
+                    f"Opening {UMA_INDEX_URL} for reverse range scan (Page {MAX_PAGES} down to Page {MIN_PAGES})..."
+                )
                 await page.goto(UMA_INDEX_URL, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(2000)
 
-                for n in range(1, MAX_PAGES + 1):
+                # Clamp start_page if MAX_PAGES is set higher than the site's actual total pages
+                site_max_page = await get_detected_max_page(page)
+                start_page = min(MAX_PAGES, site_max_page) if site_max_page >= MIN_PAGES else MAX_PAGES
+                if start_page < MAX_PAGES:
+                    logger.info(f"Site currently has {site_max_page} pages; starting reverse scan at Page {start_page}.")
+
+                current_loaded_page = 1
+                prev_first_url = ""
+                cards = await extract_cards_from_current_page(page)
+                if cards:
+                    prev_first_url = cards[0].get("tweetUrl", "")
+
+                # Traverse pages in REVERSE: e.g. 7, 6, 5, 4
+                for n in range(start_page, MIN_PAGES - 1, -1):
+                    if n != current_loaded_page:
+                        moved = await go_to_page(page, n, prev_first_url, current_loaded_page)
+                        if not moved:
+                            logger.warning(f"Page {n} could not be loaded (or does not exist), skipping to Page {n - 1}...")
+                            continue
+                        current_loaded_page = n
+
                     cards = await extract_cards_from_current_page(page)
                     if not cards:
-                        logger.warning(f"No cards found on page {n}, stopping pagination.")
-                        break
+                        logger.warning(f"No cards found on Page {n}, skipping...")
+                        continue
+                    prev_first_url = cards[0].get("tweetUrl", "")
 
                     # Resolve only the posts on page `n` that at least one target subscriber hasn't received yet
                     page_posts = await resolve_page_cards(
@@ -574,12 +662,17 @@ async def sync_to_subscribers(application: Application, target_chat_id=None):
                     )
 
                     if not page_posts:
-                        logger.info(f"Page {n}/{MAX_PAGES}: all {len(cards)} posts already delivered in DB — fast skipping.")
-                    else:
-                        logger.info(f"Page {n}/{MAX_PAGES}: delivering {len(page_posts)} new/remaining post(s)...")
+                        logger.info(
+                            f"Page {n} (Range {MAX_PAGES}->{MIN_PAGES}): all {len(cards)} posts already in DB — fast skipping."
+                        )
+                        continue
 
-                    # Deliver unseen posts from this page immediately while respecting rate limits
-                    for post in page_posts:
+                    logger.info(
+                        f"Page {n} (Range {MAX_PAGES}->{MIN_PAGES}): delivering {len(page_posts)} post(s) from bottom to top..."
+                    )
+
+                    # `reversed(page_posts)` sends from the BOTTOM of Page `n` UP to the TOP of Page `n`
+                    for post in reversed(page_posts):
                         active = set(store.get_subscribers())
                         for chat_id in targets:
                             if chat_id not in active or post.post_id in delivered_by_chat.get(chat_id, set()):
@@ -595,14 +688,9 @@ async def sync_to_subscribers(application: Application, target_chat_id=None):
                                 max(SLEEP_BETWEEN_POSTS, sent * SECONDS_PER_MEDIA_ITEM) if sent > 0 else SLEEP_BETWEEN_USERS
                             )
 
-                    # Move to next page (1 -> 2 -> ... -> 600)
-                    if n < MAX_PAGES and not await go_to_next_page(page, n + 1, cards[0].get("tweetUrl", "")):
-                        logger.info(f"Reached the final page of the website at page {n}.")
-                        break
-
                 await browser.close()
         except Exception as exc:
-            logger.error(f"Error during {MAX_PAGES}-page streaming sync: {exc}")
+            logger.error(f"Error during Page {MAX_PAGES}->{MIN_PAGES} reverse streaming sync: {exc}")
 
 
 # =====================================================================
@@ -641,10 +729,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store.clear_try_again_for_chat(chat.id)
 
     await update.message.reply_text(
-        f"✅ <b>Subscribed to Uma-Index (Full Archive Sync Active — Up to {MAX_PAGES} Pages)!</b>\n\n"
+        f"✅ <b>Subscribed to Uma-Index (Pages {MIN_PAGES}–{MAX_PAGES} Reverse Sync Active)!</b>\n\n"
         f"• <b>Chat ID:</b> <code>{chat.id}</code>\n"
         f"• <b>Posts Already Delivered to You:</b> {store.count_user_deliveries(chat.id)}\n"
-        f"• Scanning Pages 1–{MAX_PAGES} now. Already-delivered pages will be skipped automatically, and all remaining posts will stream to you at a safe rate.\n"
+        f"• Scanning from <b>Page {MAX_PAGES} down to Page {MIN_PAGES}</b> (bottom-to-top on each page) now.\n"
         f"• Tap <b>✅ Done reading</b> under any post to delete it.\n"
         f"• Send /stop at any time to pause delivery.",
         parse_mode=ParseMode.HTML,
@@ -664,8 +752,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     busy = context.application.bot_data["sync_lock"].locked()
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"✅ <b>Uma-Index {MAX_PAGES}-Page Monitor Status</b>\n"
-        f"• <b>Source Window:</b> Pages 1 to {MAX_PAGES}\n"
+        f"✅ <b>Uma-Index Page {MIN_PAGES}–{MAX_PAGES} Monitor Status</b>\n"
+        f"• <b>Source Window:</b> Page {MAX_PAGES} down to Page {MIN_PAGES} (bottom-to-top)\n"
         f"• <b>Currently Syncing/Sending:</b> {'Yes (In Progress)' if busy else 'Idle'}\n"
         f"• <b>Posts Delivered to This Chat:</b> {store.count_user_deliveries(chat_id)}\n"
         f"• <b>Labelled 'try_again' (Skipped Until Restart):</b> {store.count_user_deliveries(chat_id, 'try_again')}\n"
@@ -677,7 +765,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_forcecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🔍 Scanning Pages 1–{MAX_PAGES} of uma-index.top for any missed translations...")
+    await update.message.reply_text(
+        f"🔍 Scanning Page {MAX_PAGES} down to Page {MIN_PAGES} of uma-index.top for any missed translations..."
+    )
     asyncio.create_task(sync_to_subscribers(context.application))
 
 
@@ -722,7 +812,9 @@ def main():
         job_kwargs={"max_instances": 1},
     )
 
-    logger.info(f"Starting Uma-Index Bot (Full {MAX_PAGES}-Page Streaming + URL Sender)...")
+    logger.info(
+        f"Starting Uma-Index Bot (Reverse Page Range: Page {MAX_PAGES} -> Page {MIN_PAGES}, Bottom-to-Top)..."
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
