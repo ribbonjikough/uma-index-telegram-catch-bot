@@ -34,7 +34,7 @@ DB_PATH = "uma_seen.db"
 # PAGE WINDOW (MIN_PAGES .. MAX_PAGES) & ANTI-JAM RATE LIMIT SETTINGS
 # =====================================================================
 _min_p = max(1, int(os.getenv("MIN_PAGES", "1")))
-_max_p = max(1, int(os.getenv("MAX_PAGES", "600")))
+_max_p = max(1, int(os.getenv("MAX_PAGES", "3")))
 MIN_PAGES, MAX_PAGES = min(_min_p, _max_p), max(_min_p, _max_p)
 
 POLL_INTERVAL_SECONDS = 60 * 60  # Check the window every 60 minutes
