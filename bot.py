@@ -31,9 +31,11 @@ UMA_INDEX_URL = "https://www.uma-index.top/?mode=twitter"
 DB_PATH = "uma_seen.db"
 
 # =====================================================================
-# PAGE WINDOW & ANTI-JAM RATE LIMIT SETTINGS
+# PAGE WINDOW (MIN_PAGES .. MAX_PAGES) & ANTI-JAM RATE LIMIT SETTINGS
 # =====================================================================
-MAX_PAGES = max(1, int(os.getenv("MAX_PAGES", "3")))  # Pages to keep synced for every user (.env, default 3)
+_min_p = max(1, int(os.getenv("MIN_PAGES", "1")))
+_max_p = max(1, int(os.getenv("MAX_PAGES", "3")))
+MIN_PAGES, MAX_PAGES = min(_min_p, _max_p), max(_min_p, _max_p)
 
 POLL_INTERVAL_SECONDS = 60 * 60  # Check the window every 60 minutes
 SLEEP_BETWEEN_POSTS = 4.5        # Minimum delay (seconds) between posts
@@ -160,6 +162,10 @@ class PostStore:
         """
         return bool(self.q("SELECT 1 FROM user_deliveries WHERE chat_id = ? AND post_id = ?", str(chat_id), post_id))
 
+    def get_delivered_set(self, chat_id) -> set[str]:
+        """Fast in-memory lookup set of all post_ids already handled for a chat."""
+        return {r[0] for r in self.q("SELECT post_id FROM user_deliveries WHERE chat_id = ?", str(chat_id))}
+
     def mark(self, chat_id, post_id: str, status: str = "sent"):
         if status == "try_again":  # purge its cache entry too, so the retry re-resolves fresh image URLs
             self.q("DELETE FROM posts_cache WHERE post_id = ?", post_id)
@@ -254,7 +260,7 @@ async def resolve_tweet_images(client: httpx.AsyncClient, tweet_url: str, expect
 
 
 async def extract_cards_from_current_page(page: Page) -> list[dict]:
-    """Extracts all comic cards visible on the currently rendered DOM page."""
+    """Extracts all comic cards visible on the currently rendered DOM page (top-to-bottom)."""
     return await page.evaluate(
         r"""
         () => {
@@ -285,51 +291,120 @@ async def extract_cards_from_current_page(page: Page) -> list[dict]:
     )
 
 
-async def go_to_next_page(page: Page, target_page_num: int, prev_first_url: str) -> bool:
+async def get_detected_max_page(page: Page) -> int:
     """
-    Clicks the pagination Next / page-number button, then falls back to
-    ?mode=twitter&page=N if needed. True once the first card has changed.
+    Reads the pagination footer (e.g. '1 2 3 ... 488 Next' or '/ 488 Go') to detect the
+    actual last page on uma-index.top so MAX_PAGES=600 can clamp cleanly to the real last page.
     """
-    clicked = await page.evaluate(
-        """
-        (targetPage) => {
-            const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], span, li'));
-            for (const el of candidates) {
-                const txt = (el.innerText || el.textContent || '').trim().toUpperCase();
-                const aria = (el.getAttribute('aria-label') || '').toUpperCase();
-                if (['NEXT', 'NEXT >', '>', '»', '→'].includes(txt) || aria.includes('NEXT')) {
-                    if (!el.disabled && !el.classList.contains('disabled')) { el.click(); return true; }
+    detected = await page.evaluate(
+        r"""
+        () => {
+            let maxP = 1;
+            const bodyText = document.body ? document.body.innerText : '';
+            const slashMatch = bodyText.match(/\/\s*(\d+)\s*Go/i);
+            if (slashMatch) maxP = Math.max(maxP, parseInt(slashMatch[1], 10));
+
+            const els = Array.from(document.querySelectorAll('button, a, [role="button"], span, li'));
+            for (const el of els) {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (/^\d+$/.test(txt)) {
+                    const num = parseInt(txt, 10);
+                    if (num > maxP && num <= 5000) maxP = num;
                 }
             }
+            return maxP;
+        }
+        """
+    )
+    return max(1, int(detected or 1))
+
+
+async def go_to_page(page: Page, target_page_num: int, prev_first_url: str, current_page_num: int | None = None) -> bool:
+    """
+    Navigates directly to `target_page_num` (supporting reverse order e.g. 7 -> 6 -> 5 -> 4).
+    Tries:
+      1. Exact page-number button or 'Previous' button (if stepping backward by 1)
+      2. The 'Go to: [input] Go' box in the pagination bar
+      3. Direct URL navigation (?mode=twitter&page=N)
+    """
+    is_prev_step = current_page_num is not None and target_page_num == current_page_num - 1
+
+    clicked = await page.evaluate(
+        """
+        ({ targetPage, isPrevStep }) => {
+            const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], span, li'));
+
+            // 1. Try clicking exact page number button
             for (const el of candidates) {
-                if ((el.innerText || el.textContent || '').trim() === String(targetPage) && !el.disabled) {
-                    el.click(); return true;
+                if ((el.innerText || el.textContent || '').trim() === String(targetPage) && !el.disabled && !el.classList.contains('disabled')) {
+                    el.click();
+                    return true;
+                }
+            }
+
+            // 2. If stepping backward by 1 (e.g. 7 -> 6), try clicking Previous button
+            if (isPrevStep) {
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || '').trim().toUpperCase();
+                    const aria = (el.getAttribute('aria-label') || '').toUpperCase();
+                    if (['PREV', 'PREVIOUS', '< PREV', '< PREVIOUS', '<', '«', '←'].includes(txt) || aria.includes('PREV')) {
+                        if (!el.disabled && !el.classList.contains('disabled')) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // 3. Try using the "Go to page" numeric input + "Go" button
+            const inputs = Array.from(document.querySelectorAll('input[type="number"], input[type="text"]'));
+            for (const inp of inputs) {
+                const parentText = (inp.parentElement ? inp.parentElement.innerText : '').toUpperCase();
+                const ph = (inp.getAttribute('placeholder') || '').toUpperCase();
+                if (parentText.includes('GO') || parentText.includes('/') || ph.includes('PAGE')) {
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(inp, String(targetPage));
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    const goBtn = Array.from((inp.parentElement || document).querySelectorAll('button, a, [role="button"]'))
+                        .find(b => (b.innerText || '').trim().toUpperCase() === 'GO');
+                    if (goBtn) {
+                        goBtn.click();
+                        return true;
+                    }
+                    inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                    return true;
                 }
             }
             return false;
         }
         """,
-        target_page_num,
+        {"targetPage": target_page_num, "isPrevStep": is_prev_step},
     )
 
-    async def first_card_changed() -> bool:
+    async def first_card_ready() -> bool:
         first_href = await page.evaluate(
             "() => (document.querySelector('a[href*=\"/status/\"]') || {}).href || ''"
         )
-        return bool(first_href) and first_href != prev_first_url
+        if not first_href:
+            return False
+        return True if not prev_first_url else first_href != prev_first_url
 
     if clicked:
         for _ in range(16):
-            await page.wait_for_timeout(500)
-            if await first_card_changed():
+            await page.wait_for_timeout(350)
+            if await first_card_ready():
                 return True
 
     try:
-        await page.goto(f"{UMA_INDEX_URL}&page={target_page_num}", wait_until="networkidle", timeout=35000)
-        await page.wait_for_timeout(2000)
-        return await first_card_changed()
+        await page.goto(f"{UMA_INDEX_URL}&page={target_page_num}", wait_until="domcontentloaded", timeout=35000)
+        for _ in range(14):
+            await page.wait_for_timeout(350)
+            if await first_card_ready():
+                return True
+        return False
     except Exception as exc:
-        logger.warning(f"Fallback navigation to page {target_page_num} failed: {exc}")
+        logger.warning(f"Navigation to page {target_page_num} failed: {exc}")
         return False
 
 
@@ -350,77 +425,56 @@ def parse_card(raw_text: str) -> dict:
     return dict(character=character, artist=artist, translator=translator, date_str=date_str)
 
 
-async def scrape_uma_index_pages(store: PostStore) -> list[UmaComicPost]:
+async def resolve_page_cards(
+    cards: list[dict],
+    seen: set[str],
+    store: PostStore,
+    client: httpx.AsyncClient,
+    targets: list[str],
+    delivered_by_chat: dict[str, set[str]],
+) -> list[UmaComicPost]:
     """
-    Scrapes pages 1..MAX_PAGES (newest -> oldest). The tweet's own photo list is the source of
-    truth for images; the card thumbnail is only a fallback, and only for single-page comics.
-    SQLite cache means previously resolved tweets don't re-query the external APIs.
+    Converts one page's raw cards into UmaComicPost objects (in top-to-bottom DOM order).
+    If every target chat has ALREADY received a post_id, skips resolving it entirely.
     """
-    raw_cards: list[dict] = []
+    page_posts: list[UmaComicPost] = []
+    for item in cards:
+        tweet_url = (item.get("tweetUrl") or "").strip()
+        match = TWEET_ID_REGEX.search(tweet_url)
+        post_id = match.group(1) if match else tweet_url
+        if not tweet_url or post_id in seen:
+            continue
+        seen.add(post_id)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await (await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            )
-        )).new_page()
+        # Fast skip: if all target subscribers already have this post in uma_seen.db, skip API resolution
+        if all(post_id in delivered_by_chat.get(cid, set()) for cid in targets):
+            continue
 
-        logger.info(f"Scanning up to {MAX_PAGES} pages from {UMA_INDEX_URL} ...")
-        await page.goto(UMA_INDEX_URL, wait_until="networkidle", timeout=45000)
-        await page.wait_for_timeout(2500)
+        raw_text = item.get("rawText") or ""
+        expected = int(m.group(1)) if (m := re.search(r"\b(\d+)P\b", raw_text)) else 1
 
-        for n in range(1, MAX_PAGES + 1):
-            cards = await extract_cards_from_current_page(page)
-            if not cards:
-                logger.warning(f"No cards found on page {n}, stopping pagination.")
-                break
-            logger.info(f"Page {n}/{MAX_PAGES}: extracted {len(cards)} cards.")
-            raw_cards.extend(cards)
-            if n < MAX_PAGES and not await go_to_next_page(page, n + 1, cards[0].get("tweetUrl", "")):
-                logger.info(f"Reached end of available pagination at page {n}.")
-                break
-        await browser.close()
+        cached = store.get_cached_post(post_id)
+        if cached and len(cached.image_urls) >= expected:
+            page_posts.append(cached)
+            continue
 
-    seen: set[str] = set()  # keyed by post id: x.com / twitter.com / ?s=20 variants of one tweet are one post
-    posts: list[UmaComicPost] = []
+        images = await resolve_tweet_images(client, tweet_url, expected)
+        if not images and expected <= 1 and (thumb := upgrade_twimg_url(item.get("imgSrc") or "")):
+            images = [thumb]
+        if not images:
+            logger.warning(f"No images resolved for post {post_id} ({expected}P), retrying next scan.")
+            continue
+        if len(images) < expected:
+            logger.warning(f"Post {post_id}: tweet exposes {len(images)} of {expected} pages.")
 
-    async with httpx.AsyncClient(follow_redirects=True, headers=API_HEADERS) as client:
-        for item in raw_cards:
-            tweet_url = (item.get("tweetUrl") or "").strip()
-            match = TWEET_ID_REGEX.search(tweet_url)
-            post_id = match.group(1) if match else tweet_url
-            if not tweet_url or post_id in seen:
-                continue
-            seen.add(post_id)
+        post = UmaComicPost(
+            post_id=post_id, tweet_url=tweet_url, image_urls=images, **parse_card(raw_text),
+        )
+        store.save_post_to_cache(post)
+        page_posts.append(post)
+        await asyncio.sleep(0.2)
 
-            raw_text = item.get("rawText") or ""
-            expected = int(m.group(1)) if (m := re.search(r"\b(\d+)P\b", raw_text)) else 1  # "2P" badge on the card
-
-            # A cached post with fewer pages than the card announces is stale: re-resolve it
-            cached = store.get_cached_post(post_id)
-            if cached and len(cached.image_urls) >= expected:
-                posts.append(cached)
-                continue
-
-            images = await resolve_tweet_images(client, tweet_url, expected)
-            if not images and expected <= 1 and (thumb := upgrade_twimg_url(item.get("imgSrc") or "")):
-                images = [thumb]
-            if not images:  # never send a thumbnail for a multi-page comic: retried next scan
-                logger.warning(f"No images resolved for post {post_id} ({expected}P), retrying next scan.")
-                continue
-            if len(images) < expected:
-                logger.warning(f"Post {post_id}: tweet exposes {len(images)} of {expected} pages.")
-
-            post = UmaComicPost(
-                post_id=post_id, tweet_url=tweet_url, image_urls=images, **parse_card(raw_text),
-            )
-            store.save_post_to_cache(post)
-            posts.append(post)
-            await asyncio.sleep(0.25)  # brief pause when hitting the APIs for brand-new posts
-
-    return posts
+    return page_posts
 
 
 # =====================================================================
@@ -528,9 +582,14 @@ async def send_comic_post(bot, store: PostStore, chat_id, post: UmaComicPost) ->
 
 
 # =====================================================================
-# ROLLING SYNC ENGINE (CRASH-SAFE & DUPLICATE-PROOF)
+# REVERSE PAGE-RANGE SYNC ENGINE (MAX_PAGES -> MIN_PAGES, BOTTOM -> UP)
 # =====================================================================
 async def sync_to_subscribers(application: Application, target_chat_id=None):
+    """
+    Streams through Pages MAX_PAGES down to MIN_PAGES (e.g. Page 7 -> 6 -> 5 -> 4).
+    On each page, posts are sent from the BOTTOM of the page UPWARD (`reversed(page_posts)`),
+    so comics always arrive in true chronological order (earliest post -> latest post).
+    """
     store: PostStore = application.bot_data["store"]
 
     async with application.bot_data["sync_lock"]:
@@ -539,29 +598,99 @@ async def sync_to_subscribers(application: Application, target_chat_id=None):
             logger.info("No active subscribers yet. Waiting for /start or channel invite.")
             return
 
-        try:
-            posts = await scrape_uma_index_pages(store)
-        except Exception as exc:
-            logger.error(f"Error scraping {MAX_PAGES} pages of uma-index.top: {exc}")
-            return
-        if not posts:
-            logger.warning(f"No posts extracted during {MAX_PAGES}-page scan.")
-            return
+        # Preload each subscriber's delivered post_ids from uma_seen.db for instant O(1) skipping
+        delivered_by_chat: dict[str, set[str]] = {cid: store.get_delivered_set(cid) for cid in targets}
+        seen_in_scan: set[str] = set()
 
-        for post in reversed(posts):  # oldest first, so chats read in order
-            active = set(store.get_subscribers())
-            for chat_id in targets:
-                if chat_id not in active or store.is_delivered(chat_id, post.post_id):
-                    continue
-                sent = await send_comic_post(application.bot, store, chat_id, post)
-                if sent > 0:
-                    store.mark(chat_id, post.post_id)
-                elif sent == -1:
-                    # Labelled 'try_again' in DB: ignored by polls, retried on next bot startup or /start
-                    store.mark(chat_id, post.post_id, "try_again")
-                await asyncio.sleep(
-                    max(SLEEP_BETWEEN_POSTS, sent * SECONDS_PER_MEDIA_ITEM) if sent > 0 else SLEEP_BETWEEN_USERS
+        try:
+            async with (
+                async_playwright() as p,
+                httpx.AsyncClient(follow_redirects=True, headers=API_HEADERS) as client,
+            ):
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+                    )
                 )
+                # Block unnecessary browser assets (fonts/media/stylesheets) so pages load fast & light
+                await context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("font", "media", "stylesheet")
+                    else route.continue_(),
+                )
+                page = await context.new_page()
+
+                logger.info(
+                    f"Opening {UMA_INDEX_URL} for reverse range scan (Page {MAX_PAGES} down to Page {MIN_PAGES})..."
+                )
+                await page.goto(UMA_INDEX_URL, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(2000)
+
+                # Clamp start_page if MAX_PAGES is set higher than the site's actual total pages
+                site_max_page = await get_detected_max_page(page)
+                start_page = min(MAX_PAGES, site_max_page) if site_max_page >= MIN_PAGES else MAX_PAGES
+                if start_page < MAX_PAGES:
+                    logger.info(f"Site currently has {site_max_page} pages; starting reverse scan at Page {start_page}.")
+
+                current_loaded_page = 1
+                prev_first_url = ""
+                cards = await extract_cards_from_current_page(page)
+                if cards:
+                    prev_first_url = cards[0].get("tweetUrl", "")
+
+                # Traverse pages in REVERSE: e.g. 7, 6, 5, 4
+                for n in range(start_page, MIN_PAGES - 1, -1):
+                    if n != current_loaded_page:
+                        moved = await go_to_page(page, n, prev_first_url, current_loaded_page)
+                        if not moved:
+                            logger.warning(f"Page {n} could not be loaded (or does not exist), skipping to Page {n - 1}...")
+                            continue
+                        current_loaded_page = n
+
+                    cards = await extract_cards_from_current_page(page)
+                    if not cards:
+                        logger.warning(f"No cards found on Page {n}, skipping...")
+                        continue
+                    prev_first_url = cards[0].get("tweetUrl", "")
+
+                    # Resolve only the posts on page `n` that at least one target subscriber hasn't received yet
+                    page_posts = await resolve_page_cards(
+                        cards, seen_in_scan, store, client, targets, delivered_by_chat
+                    )
+
+                    if not page_posts:
+                        logger.info(
+                            f"Page {n} (Range {MAX_PAGES}->{MIN_PAGES}): all {len(cards)} posts already in DB — fast skipping."
+                        )
+                        continue
+
+                    logger.info(
+                        f"Page {n} (Range {MAX_PAGES}->{MIN_PAGES}): delivering {len(page_posts)} post(s) from bottom to top..."
+                    )
+
+                    # `reversed(page_posts)` sends from the BOTTOM of Page `n` UP to the TOP of Page `n`
+                    for post in reversed(page_posts):
+                        active = set(store.get_subscribers())
+                        for chat_id in targets:
+                            if chat_id not in active or post.post_id in delivered_by_chat.get(chat_id, set()):
+                                continue
+                            sent = await send_comic_post(application.bot, store, chat_id, post)
+                            if sent > 0:
+                                store.mark(chat_id, post.post_id)
+                                delivered_by_chat.setdefault(chat_id, set()).add(post.post_id)
+                            elif sent == -1:
+                                store.mark(chat_id, post.post_id, "try_again")
+                                delivered_by_chat.setdefault(chat_id, set()).add(post.post_id)
+                            await asyncio.sleep(
+                                max(SLEEP_BETWEEN_POSTS, sent * SECONDS_PER_MEDIA_ITEM) if sent > 0 else SLEEP_BETWEEN_USERS
+                            )
+
+                await browser.close()
+        except Exception as exc:
+            logger.error(f"Error during Page {MAX_PAGES}->{MIN_PAGES} reverse streaming sync: {exc}")
 
 
 # =====================================================================
@@ -600,10 +729,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store.clear_try_again_for_chat(chat.id)
 
     await update.message.reply_text(
-        f"✅ <b>Subscribed to Uma-Index ({MAX_PAGES}-Page Sync Active)!</b>\n\n"
+        f"✅ <b>Subscribed to Uma-Index (Pages {MIN_PAGES}–{MAX_PAGES} Reverse Sync Active)!</b>\n\n"
         f"• <b>Chat ID:</b> <code>{chat.id}</code>\n"
         f"• <b>Posts Already Delivered to You:</b> {store.count_user_deliveries(chat.id)}\n"
-        f"• Scanning Pages 1–{MAX_PAGES} now. Any posts you haven't received yet will be sent shortly (paced to respect Telegram rate limits).\n"
+        f"• Scanning from <b>Page {MAX_PAGES} down to Page {MIN_PAGES}</b> (bottom-to-top on each page) now.\n"
         f"• Tap <b>✅ Done reading</b> under any post to delete it.\n"
         f"• Send /stop at any time to pause delivery.",
         parse_mode=ParseMode.HTML,
@@ -623,8 +752,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     busy = context.application.bot_data["sync_lock"].locked()
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"✅ <b>Uma-Index {MAX_PAGES}-Page Monitor Status</b>\n"
-        f"• <b>Source Window:</b> Pages 1 to {MAX_PAGES}\n"
+        f"✅ <b>Uma-Index Page {MIN_PAGES}–{MAX_PAGES} Monitor Status</b>\n"
+        f"• <b>Source Window:</b> Page {MAX_PAGES} down to Page {MIN_PAGES} (bottom-to-top)\n"
         f"• <b>Currently Syncing/Sending:</b> {'Yes (In Progress)' if busy else 'Idle'}\n"
         f"• <b>Posts Delivered to This Chat:</b> {store.count_user_deliveries(chat_id)}\n"
         f"• <b>Labelled 'try_again' (Skipped Until Restart):</b> {store.count_user_deliveries(chat_id, 'try_again')}\n"
@@ -636,7 +765,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_forcecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🔍 Scanning Pages 1–{MAX_PAGES} of uma-index.top for any missed translations...")
+    await update.message.reply_text(
+        f"🔍 Scanning Page {MAX_PAGES} down to Page {MIN_PAGES} of uma-index.top for any missed translations..."
+    )
     asyncio.create_task(sync_to_subscribers(context.application))
 
 
@@ -681,7 +812,9 @@ def main():
         job_kwargs={"max_instances": 1},
     )
 
-    logger.info("Starting Uma-Index Bot (URL sending + API-first image resolver)...")
+    logger.info(
+        f"Starting Uma-Index Bot (Reverse Page Range: Page {MAX_PAGES} -> Page {MIN_PAGES}, Bottom-to-Top)..."
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
