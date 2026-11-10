@@ -8,7 +8,7 @@ Uma-Index Telegram Bot is a Telegram bot that monitors [uma-index.top](https://w
 
 ## Features
 
-- Scans the first few pages of the site (default 3, set with `MAX_PAGES`) and sends every translated page at full resolution.
+- Scans a page window on the site (defaults to pages `1..3`, set with `MIN_PAGES` and `MAX_PAGES`) and sends every translated page at full resolution from oldest to newest.
 - Catches up automatically: posts missed while the bot was offline are sent on the next run, and nothing is ever sent twice (tracked per chat in SQLite).
 - Works in private chats, groups and channels. Add the bot to a chat and it subscribes itself.
 - Paced sending that respects Telegram rate limits, with automatic retry on flood-wait.
@@ -67,6 +67,7 @@ cp .env.example .env
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 TELEGRAM_CHAT_ID=
+MIN_PAGES=1
 MAX_PAGES=3
 ```
 
@@ -74,7 +75,10 @@ MAX_PAGES=3
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | Yes | Token from @BotFather. |
 | `TELEGRAM_CHAT_ID` | No | A fixed channel or chat to always post to. Leave empty to post only to chats that subscribed. |
-| `MAX_PAGES` | No | How many site pages to keep synced. Default is `3`. |
+| `MIN_PAGES` | No | Lower bound of the page scan window. Default is `1`. |
+| `MAX_PAGES` | No | Upper bound of the page scan window. Default is `3`. |
+
+The bot scans inclusively between `MIN_PAGES` and `MAX_PAGES` and posts matched comics in oldest-to-newest order.
 
 ### 7. Run the Bot
 ```bash
